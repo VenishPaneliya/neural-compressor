@@ -4,7 +4,7 @@
 - Reviewed head: `8ae6450df0` (includes the pre-commit.ci auto-fix commit)
 - Scope: 17 inline findings from the Copilot review
 
-All 17 findings were checked against the code and are valid. The table below
+All 23 findings (17 in the first review round, 6 in the second) were checked against the code and are valid. The table below
 maps each finding to the fix and the verification performed. No benchmark
 scripts or state schema were intentionally removed.
 
@@ -240,6 +240,94 @@ scripts or state schema were intentionally removed.
 - Verification: static check of the arithmetic; with `--seed 42 --repeats 2`,
   rounds start at 42 and 44.
 
+## Second review round
+
+Six additional findings were raised after the first fixes. All six are valid
+and were fixed.
+
+| # | Severity | File | Finding | Fix |
+| ---: | --- | --- | --- | --- |
+| 18 | Medium | `agent_benchmarks/run_swebenchpro.sh` | Relative `SWEBENCH_PRO_RESULTS_ROOT` breaks paths after `cd` | Resolve the results root to an absolute path before deriving artifacts |
+| 19 | Medium | `agent_benchmarks/run_swebenchpro.sh`, `run_swe_verified.sh` | Suite discovery runs before vLLM is ready | Wait for `/health` before discovering the suite model |
+| 20 | Medium | `evalscope/run_evalscope_endpoint.sh` | Nested/dotted `reasoning.effort` ignored | Parse `reasoning.effort`, nested `reasoning.effort`, and `default_reasoning_effort` |
+| 21 | Medium | `humaneval_plus/humaneval_data.py` | Partial rounds included in accuracy mean/std | Compute accuracy metrics from completed rounds only |
+| 22 | Medium | `humaneval_plus/run_humaneval_plus.sh` | EvalPlus descendants survive cancellation | Launch EvalPlus in its own session and TERM/KILL the process group |
+| 23 | Medium | `humaneval_plus/run_humaneval_plus.sh` | INT/TERM exits 1 instead of 130 | Exit 130 so the state helper records `interrupted` |
+
+### 18. Resolve the Pro results root before deriving artifact paths
+
+- Comment: `discussion_r4600950040`, `agent_benchmarks/run_swebenchpro.sh:276`
+- Analysis: valid. `mini-extra` runs after `cd "${AGENT_DIR}"`, so a relative
+  `SWEBENCH_PRO_RESULTS_ROOT` made the runtime config and output paths resolve
+  relative to the agent directory instead of the caller's directory. The
+  evaluator also changes directories.
+- Fix: `RESULTS_ROOT` is resolved with `os.path.abspath` immediately after the
+  run tag is sanitized and before `readonly RESULTS_ROOT`. `OUT_DIR`,
+  `RUNTIME_CONFIG`, `REPORT_FILE`, and the suite child
+  `SWEBENCH_PRO_RESULTS_ROOT` all derive from the absolute root.
+- Verification: `bash -n`; the path derivation is now absolute by construction.
+
+### 19. Wait for vLLM readiness before suite model discovery
+
+- Comment: `discussion_r4600950112`, `agent_benchmarks/run_swebenchpro.sh:324`
+- Analysis: valid. Both suite functions called `discover_vllm_model` before the
+  readiness wait. Starting a suite while vLLM was loading weights failed
+  immediately instead of honoring `VLLM_WAIT_TIMEOUT`.
+- Fix: `wait_for_vllm "${VLLM_WAIT_TIMEOUT:-300}"` now runs before
+  `discover_vllm_model` in both `run_suite()` implementations.
+- Verification: `bash -n`; the single-run path already used this ordering.
+
+### 20. Honor nested and dotted `reasoning.effort` metadata
+
+- Comment: `discussion_r4600950205`, `evalscope/run_evalscope_endpoint.sh:175`
+- Analysis: valid. The recursive metadata search only matched keys containing
+  `reasoning_effort`. It ignored `reasoning: {"effort": "low"}` and the dotted
+  key `"reasoning.effort": "medium"`, then silently used `xhigh`.
+- Fix: the parser now recognizes `reasoning_effort`,
+  `default_reasoning_effort`, `reasoning.effort`, a nested `reasoning.effort`,
+  and a string-valued `reasoning` key before falling back to model-name
+  inference.
+- Verification: a fake `/v1/models` server returned
+  `reasoning: {"effort": "low"}` and `"reasoning.effort": "medium"`;
+  `--dry-run` printed `reasoning_effort=low` and `reasoning_effort=medium`.
+
+### 21. Compute HumanEval accuracy metrics from completed rounds only
+
+- Comment: `discussion_r4600950281`, `humaneval_plus/humaneval_data.py:189`
+- Analysis: valid. A partial sample round can cover fewer tasks than a
+  completed round; averaging their accuracies compares different denominators.
+  The reported mean/std could be skewed by partial rounds.
+- Fix: `accuracy_values` and `base_values` now come from
+  `status == "completed"` runs. `recorded_values` still counts every run with a
+  score, so partial rows remain visible and `runs_recorded` remains useful for
+  diagnosis.
+- Verification: synthetic result with one completed run at 100% and one
+  partial run at 0% produced `accuracy.mean=1.0`, `runs_recorded=2`, and
+  overall `status=partial`.
+
+### 22. Terminate EvalPlus workers and descendants on cancellation
+
+- Comment: `discussion_r4600950373`, `humaneval_plus/run_humaneval_plus.sh:257`
+- Analysis: valid. `pkill -P` only signals direct children. EvalPlus workers
+  spawn generated-code subprocesses; killing a worker can also remove the
+  process that enforces its child timeout.
+- Fix: EvalPlus is launched with `setsid`, so it becomes a session/process
+  group leader. Cleanup sends TERM to the whole group, waits up to five
+  seconds, sends KILL if needed, and reaps the leader.
+- Verification: a fake EvalPlus spawned `sleep 300`; sending TERM to the
+  runner left both the evaluator and its child stopped.
+
+### 23. Use recognized exit codes for INT and TERM cancellations
+
+- Comment: `discussion_r4600950450`, `humaneval_plus/run_humaneval_plus.sh:272`
+- Analysis: valid. The signal handler exited 1, while
+  `humaneval_data.py:337` treats only 130/143 as interruptions, so an actual
+  cancellation was recorded as `failed`.
+- Fix: `termination_requested()` now exits 130, matching the state helper's
+  interruption convention.
+- Verification: the process-group signal test produced
+  `status=interrupted`, `exit_code=130`, and `message=interrupted`.
+
 ## Additional CI item: DCO
 
 The DCO check failed because the branch commits did not contain
@@ -263,4 +351,7 @@ commits.
 - 7-round smoke validation before the review fixes:
   SWE Verified Mini, SWE-bench Pro 120-subset, and HumanEval+ completed with
   `rc=0`; EvalScope and IFBench were stopped when the review fixes began and
-  must be rerun against the fixed scripts.
+  were rerun against the fixed scripts.
+- Second-round checks: fake model metadata for nested/dotted
+  `reasoning.effort`, synthetic HumanEval completed/partial metrics, and a
+  process-group cancellation test with a fake EvalPlus child.
